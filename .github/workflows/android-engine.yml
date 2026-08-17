@@ -1,0 +1,314 @@
+name: Build Nahid SDXL Engine V2
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Android ARM64 CPU + Adreno OpenCL
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        shell: bash
+        run: |
+          sdkmanager "ndk;26.3.11579264"
+
+          echo "NDK=$ANDROID_SDK_ROOT/ndk/26.3.11579264" >> "$GITHUB_ENV"
+
+      - name: Install build tools
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            ninja-build \
+            git \
+            zip \
+            file
+
+      # ---------------------------------------------------------
+      # OpenCL headers
+      # ---------------------------------------------------------
+
+      - name: Install OpenCL headers
+        shell: bash
+        run: |
+          git clone \
+            --depth 1 \
+            https://github.com/KhronosGroup/OpenCL-Headers.git \
+            "$RUNNER_TEMP/OpenCL-Headers"
+
+          cp -R \
+            "$RUNNER_TEMP/OpenCL-Headers/CL" \
+            "$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/"
+
+      # ---------------------------------------------------------
+      # Build OpenCL ICD loader ONLY for link-time.
+      # It will NOT be packaged inside our Android engine.
+      # Android will use the phone/vendor libOpenCL.so.
+      # ---------------------------------------------------------
+
+      - name: Build OpenCL link library
+        shell: bash
+        run: |
+          git clone \
+            --depth 1 \
+            https://github.com/KhronosGroup/OpenCL-ICD-Loader.git \
+            "$RUNNER_TEMP/OpenCL-ICD-Loader"
+
+          cmake \
+            -S "$RUNNER_TEMP/OpenCL-ICD-Loader" \
+            -B "$RUNNER_TEMP/opencl-build" \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DOPENCL_ICD_LOADER_HEADERS_DIR="$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=24 \
+            -DANDROID_STL=c++_shared \
+            -DBUILD_TESTING=OFF
+
+          cmake --build "$RUNNER_TEMP/opencl-build" -j 2
+
+          cp \
+            "$RUNNER_TEMP/opencl-build/libOpenCL.so" \
+            "$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libOpenCL.so"
+
+      # ---------------------------------------------------------
+      # Configure CLEAN engine
+      # ---------------------------------------------------------
+
+      - name: Configure clean Android engine
+        shell: bash
+        run: |
+          cmake \
+            -S . \
+            -B build-nahid \
+            -G Ninja \
+            \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-28 \
+            -DANDROID_STL=c++_shared \
+            \
+            -DSD_BUILD_SHARED_LIBS=ON \
+            -DSD_BUILD_SHARED_GGML_LIB=OFF \
+            -DSD_BUILD_EXAMPLES=OFF \
+            \
+            -DSD_OPENCL=ON \
+            -DSD_VULKAN=OFF \
+            -DSD_CUDA=OFF \
+            -DSD_METAL=OFF \
+            -DSD_HIPBLAS=OFF \
+            -DSD_SYCL=OFF \
+            -DSD_MUSA=OFF \
+            -DSD_RPC=OFF \
+            \
+            -DSD_WEBP=OFF \
+            -DSD_WEBM=OFF \
+            \
+            -DBUILD_SHARED_LIBS=OFF \
+            \
+            -DGGML_CPU=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU_ALL_VARIANTS=OFF \
+            -DGGML_CPU_REPACK=OFF \
+            \
+            -DGGML_OPENMP=OFF \
+            -DGGML_BLAS=OFF \
+            -DGGML_LLAMAFILE=OFF \
+            -DGGML_RPC=OFF \
+            -DGGML_BACKEND_DL=OFF \
+            \
+            -DGGML_BUILD_TESTS=OFF \
+            -DGGML_BUILD_EXAMPLES=OFF \
+            \
+            -DGGML_OPENCL=ON \
+            -DGGML_OPENCL_PROFILING=OFF \
+            -DGGML_OPENCL_USE_ADRENO_KERNELS=ON \
+            -DGGML_OPENCL_EMBED_KERNELS=ON \
+            -DGGML_OPENCL_TARGET_VERSION=300 \
+            \
+            -DGGML_HEXAGON=OFF \
+            -DGGML_OPENVINO=OFF \
+            \
+            -DCMAKE_C_FLAGS_RELEASE="-O2 -DNDEBUG -ffunction-sections -fdata-sections" \
+            -DCMAKE_CXX_FLAGS_RELEASE="-O2 -DNDEBUG -ffunction-sections -fdata-sections" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-Wl,--gc-sections -Wl,--icf=safe"
+
+      # ---------------------------------------------------------
+      # Build ONLY library.
+      # No CLI / server / converter / test executable.
+      # ---------------------------------------------------------
+
+      - name: Build engine
+        shell: bash
+        run: |
+          cmake \
+            --build build-nahid \
+            --target stable-diffusion \
+            -j 2
+
+      # ---------------------------------------------------------
+      # Prepare final package
+      # ---------------------------------------------------------
+
+      - name: Prepare final engine
+        shell: bash
+        run: |
+          mkdir -p output/arm64-v8a
+          mkdir -p output/audit
+
+          SD_SO=$(find build-nahid \
+            -type f \
+            -name "libstable-diffusion.so" \
+            | head -n 1)
+
+          if [ -z "$SD_SO" ]; then
+            echo "ERROR: libstable-diffusion.so not found"
+            exit 1
+          fi
+
+          echo "Found engine:"
+          echo "$SD_SO"
+
+          # Strip symbols
+          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" \
+            --strip-unneeded \
+            "$SD_SO"
+
+          cp \
+            "$SD_SO" \
+            output/arm64-v8a/libstable-diffusion.so
+
+          cp \
+            "$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" \
+            output/arm64-v8a/libc++_shared.so
+
+      # ---------------------------------------------------------
+      # Binary audit
+      # ---------------------------------------------------------
+
+      - name: Audit architecture and dependencies
+        shell: bash
+        run: |
+          ENGINE="output/arm64-v8a/libstable-diffusion.so"
+
+          echo "==================================" \
+            | tee output/audit/report.txt
+
+          echo "NAHID SDXL ENGINE V2" \
+            | tee -a output/audit/report.txt
+
+          echo "==================================" \
+            | tee -a output/audit/report.txt
+
+          echo "" \
+            | tee -a output/audit/report.txt
+
+          echo "FILE INFO:" \
+            | tee -a output/audit/report.txt
+
+          file "$ENGINE" \
+            | tee -a output/audit/report.txt
+
+          echo "" \
+            | tee -a output/audit/report.txt
+
+          echo "SIZE:" \
+            | tee -a output/audit/report.txt
+
+          ls -lh output/arm64-v8a/ \
+            | tee -a output/audit/report.txt
+
+          echo "" \
+            | tee -a output/audit/report.txt
+
+          echo "DEPENDENCIES:" \
+            | tee -a output/audit/report.txt
+
+          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" \
+            -d "$ENGINE" \
+            | grep NEEDED \
+            | tee -a output/audit/report.txt
+
+          echo "" \
+            | tee -a output/audit/report.txt
+
+          echo "SHA256:" \
+            | tee -a output/audit/report.txt
+
+          sha256sum "$ENGINE" \
+            | tee -a output/audit/report.txt
+
+      # ---------------------------------------------------------
+      # Reject unwanted runtime libraries
+      # ---------------------------------------------------------
+
+      - name: Verify no unwanted GPU/runtime dependencies
+        shell: bash
+        run: |
+          ENGINE="output/arm64-v8a/libstable-diffusion.so"
+
+          DEPS=$(
+            "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" \
+              -d "$ENGINE" \
+              | grep NEEDED || true
+          )
+
+          echo "$DEPS"
+
+          if echo "$DEPS" | grep -Eqi \
+            "vulkan|cuda|cudart|hip|metal|sycl|openmp|libomp|blas"; then
+
+            echo "ERROR: unwanted backend dependency detected"
+            exit 1
+          fi
+
+          echo "Dependency audit passed."
+
+      # ---------------------------------------------------------
+      # Final package sanity check
+      # ---------------------------------------------------------
+
+      - name: Verify output package
+        shell: bash
+        run: |
+          echo "Final files:"
+          find output -type f -maxdepth 3 -print
+
+          test -f \
+            output/arm64-v8a/libstable-diffusion.so
+
+          test -f \
+            output/arm64-v8a/libc++_shared.so
+
+          echo ""
+          echo "FINAL PACKAGE SIZE:"
+          du -sh output
+
+      # ---------------------------------------------------------
+      # Upload
+      # ---------------------------------------------------------
+
+      - name: Upload Nahid engine
+        uses: actions/upload-artifact@v4
+        with:
+          name: nahid-sdxl-engine-v2-arm64
+          path: output/
+          compression-level: 9
+          if-no-files-found: error
