@@ -1,0 +1,129 @@
+name: Build Android SD Engine
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-android-engine:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout stable-diffusion.cpp
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        shell: bash
+        run: |
+          sdkmanager "ndk;26.2.11394342"
+          echo "NDK=$ANDROID_SDK_ROOT/ndk/26.2.11394342" >> "$GITHUB_ENV"
+
+      - name: Install build tools
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build git
+
+      - name: Setup OpenCL headers
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/KhronosGroup/OpenCL-Headers.git "$RUNNER_TEMP/OpenCL-Headers"
+
+          cp -R \
+            "$RUNNER_TEMP/OpenCL-Headers/CL" \
+            "$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/"
+
+      - name: Build Android OpenCL link library
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/KhronosGroup/OpenCL-ICD-Loader.git "$RUNNER_TEMP/OpenCL-ICD-Loader"
+
+          cmake \
+            -S "$RUNNER_TEMP/OpenCL-ICD-Loader" \
+            -B "$RUNNER_TEMP/opencl-build" \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DOPENCL_ICD_LOADER_HEADERS_DIR="$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=24 \
+            -DANDROID_STL=c++_shared
+
+          cmake --build "$RUNNER_TEMP/opencl-build" -j 2
+
+          cp \
+            "$RUNNER_TEMP/opencl-build/libOpenCL.so" \
+            "$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libOpenCL.so"
+
+      - name: Configure stable-diffusion.cpp
+        shell: bash
+        run: |
+          cmake \
+            -S . \
+            -B build-android \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=MinSizeRel \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-28 \
+            -DANDROID_STL=c++_shared \
+            -DGGML_OPENMP=OFF \
+            -DSD_OPENCL=ON \
+            -DSD_VULKAN=OFF \
+            -DSD_CUDA=OFF \
+            -DSD_METAL=OFF \
+            -DSD_HIPBLAS=OFF \
+            -DSD_SYCL=OFF \
+            -DSD_MUSA=OFF \
+            -DSD_WEBP=OFF \
+            -DSD_WEBM=OFF \
+            -DSD_BUILD_EXAMPLES=OFF \
+            -DSD_BUILD_SHARED_LIBS=ON \
+            -DSD_BUILD_SHARED_GGML_LIB=OFF
+
+      - name: Build engine
+        shell: bash
+        run: |
+          cmake --build build-android --target stable-diffusion -j 2
+
+      - name: Prepare small engine package
+        shell: bash
+        run: |
+          mkdir -p output/arm64-v8a
+
+          SD_SO=$(find build-android -type f -name "libstable-diffusion.so" | head -n 1)
+
+          if [ -z "$SD_SO" ]; then
+            echo "ERROR: libstable-diffusion.so not found"
+            exit 1
+          fi
+
+          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" \
+            --strip-unneeded "$SD_SO"
+
+          cp "$SD_SO" output/arm64-v8a/
+
+          cp \
+            "$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" \
+            output/arm64-v8a/
+
+          echo "=== Engine files ==="
+          ls -lh output/arm64-v8a/
+
+          echo "=== Engine size ==="
+          du -h output/arm64-v8a/libstable-diffusion.so
+
+      - name: Upload Android engine
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-sd-engine-arm64
+          path: output/
+          compression-level: 9
