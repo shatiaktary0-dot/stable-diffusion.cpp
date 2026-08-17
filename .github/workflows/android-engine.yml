@@ -1,0 +1,394 @@
+name: Build Nahid SDXL V4
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Android ARM64 Modern Adreno OpenCL
+    runs-on: ubuntu-24.04
+
+    steps:
+      # ==========================================================
+      # 1. Latest stable-diffusion.cpp
+      # ==========================================================
+      - name: Checkout latest source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Record source version
+        shell: bash
+        run: |
+          echo "SD_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          git log -1 --format="Commit: %H%nDate: %ci%nSubject: %s"
+
+      # ==========================================================
+      # 2. Android SDK / NDK
+      # ==========================================================
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        shell: bash
+        run: |
+          sdkmanager "ndk;26.3.11579264"
+          echo "NDK=$ANDROID_SDK_ROOT/ndk/26.3.11579264" >> "$GITHUB_ENV"
+
+      # ==========================================================
+      # 3. Required host tools
+      # ==========================================================
+      - name: Install build tools
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            ninja-build \
+            git \
+            file \
+            binutils
+
+      # ==========================================================
+      # 4. OpenCL headers
+      # ==========================================================
+      - name: Install OpenCL headers
+        shell: bash
+        run: |
+          git clone \
+            --depth 1 \
+            https://github.com/KhronosGroup/OpenCL-Headers.git \
+            "$RUNNER_TEMP/OpenCL-Headers"
+
+          cp -R \
+            "$RUNNER_TEMP/OpenCL-Headers/CL" \
+            "$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/"
+
+      # ==========================================================
+      # 5. OpenCL ICD loader
+      # BUILD-TIME ONLY.
+      # We do NOT package this libOpenCL.so.
+      # Phone uses vendor OpenCL.
+      # ==========================================================
+      - name: Build OpenCL link library
+        shell: bash
+        run: |
+          git clone \
+            --depth 1 \
+            https://github.com/KhronosGroup/OpenCL-ICD-Loader.git \
+            "$RUNNER_TEMP/OpenCL-ICD-Loader"
+
+          cmake \
+            -S "$RUNNER_TEMP/OpenCL-ICD-Loader" \
+            -B "$RUNNER_TEMP/opencl-build" \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DOPENCL_ICD_LOADER_HEADERS_DIR="$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=24 \
+            -DANDROID_STL=c++_shared \
+            -DBUILD_TESTING=OFF
+
+          cmake --build "$RUNNER_TEMP/opencl-build" -j 2
+
+          cp \
+            "$RUNNER_TEMP/opencl-build/libOpenCL.so" \
+            "$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libOpenCL.so"
+
+      # ==========================================================
+      # 6. Configure V4
+      #
+      # KEEP:
+      # CPU
+      # OpenCL
+      # modern Q4_K
+      # Adreno kernels
+      # SDXL
+      #
+      # REMOVE:
+      # Vulkan/CUDA/Metal/etc.
+      # WebP/WebM/examples/OpenMP/BLAS
+      # ==========================================================
+      - name: Configure Nahid V4
+        shell: bash
+        run: |
+          cmake \
+            -S . \
+            -B build-v4 \
+            -G Ninja \
+            \
+            -DCMAKE_BUILD_TYPE=MinSizeRel \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-28 \
+            -DANDROID_STL=c++_shared \
+            \
+            -DSD_BUILD_SHARED_LIBS=ON \
+            -DSD_BUILD_SHARED_GGML_LIB=OFF \
+            -DSD_BUILD_EXAMPLES=OFF \
+            \
+            -DSD_OPENCL=ON \
+            -DSD_VULKAN=OFF \
+            -DSD_CUDA=OFF \
+            -DSD_METAL=OFF \
+            -DSD_HIPBLAS=OFF \
+            -DSD_SYCL=OFF \
+            -DSD_MUSA=OFF \
+            \
+            -DSD_WEBP=OFF \
+            -DSD_WEBM=OFF \
+            \
+            -DGGML_OPENMP=OFF \
+            -DGGML_BLAS=OFF \
+            -DGGML_NATIVE=OFF \
+            -DGGML_RPC=OFF \
+            \
+            -DGGML_OPENCL=ON \
+            -DGGML_OPENCL_USE_ADRENO_KERNELS=ON \
+            -DGGML_OPENCL_USE_ADRENO_BIN_KERNELS=OFF \
+            -DGGML_OPENCL_EMBED_KERNELS=ON \
+            -DGGML_OPENCL_PROFILING=OFF \
+            \
+            -DCMAKE_C_FLAGS_MINSIZEREL="-Os -DNDEBUG -ffunction-sections -fdata-sections" \
+            -DCMAKE_CXX_FLAGS_MINSIZEREL="-Os -DNDEBUG -ffunction-sections -fdata-sections" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-Wl,--gc-sections"
+
+      # ==========================================================
+      # 7. Build only the library
+      # ==========================================================
+      - name: Build engine
+        shell: bash
+        run: |
+          cmake \
+            --build build-v4 \
+            --target stable-diffusion \
+            -j 2
+
+      # ==========================================================
+      # 8. Prepare final package
+      # ==========================================================
+      - name: Prepare engine
+        shell: bash
+        run: |
+          mkdir -p output/arm64-v8a
+          mkdir -p output/audit
+
+          ENGINE=$(
+            find build-v4 \
+              -type f \
+              -name "libstable-diffusion.so" \
+              | head -n 1
+          )
+
+          if [ -z "$ENGINE" ]; then
+            echo "ERROR: libstable-diffusion.so not found"
+            exit 1
+          fi
+
+          echo "Engine found:"
+          echo "$ENGINE"
+
+          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" \
+            --strip-unneeded \
+            "$ENGINE"
+
+          cp "$ENGINE" \
+            output/arm64-v8a/libstable-diffusion.so
+
+          cp \
+            "$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" \
+            output/arm64-v8a/libc++_shared.so
+
+      # ==========================================================
+      # 9. Deep binary audit
+      # ==========================================================
+      - name: Audit V4
+        shell: bash
+        run: |
+          ENGINE="output/arm64-v8a/libstable-diffusion.so"
+          READELF="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+
+          strings "$ENGINE" > output/audit/strings.txt
+
+          {
+            echo "======================================="
+            echo "NAHID SDXL V4 AUDIT"
+            echo "======================================="
+            echo
+            echo "Stable Diffusion commit:"
+            echo "$SD_COMMIT"
+            echo
+
+            echo "FILE:"
+            file "$ENGINE"
+            echo
+
+            echo "SIZE:"
+            ls -lh output/arm64-v8a/
+            echo
+
+            echo "DEPENDENCIES:"
+            "$READELF" -d "$ENGINE" | grep NEEDED || true
+            echo
+
+            echo "SECTIONS:"
+            "$READELF" -S "$ENGINE" || true
+            echo
+
+            echo "SHA256:"
+            sha256sum "$ENGINE"
+
+          } | tee output/audit/report.txt
+
+      # ==========================================================
+      # 10. Critical Q4_K/OpenCL checks
+      # ==========================================================
+      - name: Verify modern Q4_K OpenCL
+        shell: bash
+        run: |
+          ENGINE="output/arm64-v8a/libstable-diffusion.so"
+          STRINGS="output/audit/strings.txt"
+
+          echo "Checking Q4_K..."
+
+          grep -qi "q4_K" "$STRINGS" || {
+            echo "ERROR: Q4_K marker missing"
+            exit 1
+          }
+
+          echo "Checking OpenCL..."
+
+          grep -qi "OpenCL" "$STRINGS" || {
+            echo "ERROR: OpenCL marker missing"
+            exit 1
+          }
+
+          echo "Checking Adreno..."
+
+          grep -qi "Adreno" "$STRINGS" || {
+            echo "WARNING: Adreno text marker not found."
+          }
+
+          echo "Q4_K + OpenCL audit passed."
+
+      # ==========================================================
+      # 11. Required Stable Diffusion / SDXL API
+      # ==========================================================
+      - name: Verify image APIs
+        shell: bash
+        run: |
+          ENGINE="output/arm64-v8a/libstable-diffusion.so"
+
+          SYMBOLS=$(
+            "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" \
+              -D \
+              "$ENGINE" || true
+          )
+
+          echo "$SYMBOLS" > output/audit/symbols.txt
+
+          for SYMBOL in \
+            new_sd_ctx \
+            generate_image \
+            free_sd_ctx
+          do
+            if ! grep -q "$SYMBOL" output/audit/symbols.txt; then
+              echo "ERROR: Required symbol missing: $SYMBOL"
+              exit 1
+            fi
+          done
+
+          echo "Core image APIs present."
+
+      # ==========================================================
+      # 12. Reject unwanted runtime backends
+      # ==========================================================
+      - name: Reject unwanted backend dependencies
+        shell: bash
+        run: |
+          ENGINE="output/arm64-v8a/libstable-diffusion.so"
+
+          DEPS=$(
+            "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" \
+              -d "$ENGINE" \
+              | grep NEEDED || true
+          )
+
+          echo "$DEPS"
+
+          if echo "$DEPS" | grep -Eqi \
+            "vulkan|cuda|cudart|cublas|hip|metal|sycl|libomp|openmp|blas"; then
+
+            echo "ERROR: unwanted backend dependency detected"
+            exit 1
+          fi
+
+          echo "Dependency audit passed."
+
+      # ==========================================================
+      # 13. Record model-family bloat
+      # Do NOT fail build; we will prune after GPU test.
+      # ==========================================================
+      - name: Count unnecessary model families
+        shell: bash
+        run: |
+          S="output/audit/strings.txt"
+
+          {
+            echo "MODEL FAMILY AUDIT"
+
+            for TERM in \
+              "Flux" \
+              "Wan" \
+              "Qwen" \
+              "Z-Image" \
+              "Ideogram" \
+              "Krea" \
+              "LTX" \
+              "PhotoMaker" \
+              "ControlNet" \
+              "ESRGAN"
+            do
+              COUNT=$(grep -i -c "$TERM" "$S" || true)
+              echo "$TERM = $COUNT"
+            done
+
+          } | tee output/audit/model-family-audit.txt
+
+      # ==========================================================
+      # 14. Final report
+      # ==========================================================
+      - name: Final report
+        shell: bash
+        run: |
+          echo "======================================="
+          echo "NAHID SDXL V4 READY FOR DEVICE TEST"
+          echo "======================================="
+
+          echo
+          echo "Files:"
+          find output -maxdepth 3 -type f -print
+
+          echo
+          echo "Engine:"
+          du -h output/arm64-v8a/libstable-diffusion.so
+
+          echo
+          echo "Total:"
+          du -sh output
+
+      # ==========================================================
+      # 15. Artifact
+      # ==========================================================
+      - name: Upload Nahid SDXL V4
+        uses: actions/upload-artifact@v4
+        with:
+          name: nahid-sdxl-v4-arm64
+          path: output/
+          compression-level: 9
+          if-no-files-found: error
